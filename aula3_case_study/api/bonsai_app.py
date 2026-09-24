@@ -9,6 +9,9 @@ import requests
 import json
 import logging
 import os
+import threading
+import uuid
+from collections import OrderedDict
 from datetime import datetime
 from typing import Dict, Any, List
 
@@ -23,6 +26,28 @@ app = Flask(__name__)
 # Configuration
 MLFLOW_TRACKING_URI = os.getenv('MLFLOW_TRACKING_URI', 'http://mlflow:5000')
 EXPERIMENT_NAME = 'Bonsai-Care-Prompt-Engineering'
+
+# Live traffic is traced into its own experiment, separate from the evaluation runs.
+#
+# The two answer different questions. EXPERIMENT_NAME answers "which Prompt Mode scored
+# best on our Evaluation Set" — four runs, made on purpose, before deploying. This one
+# answers "what did customers actually ask, and what did we actually answer" — one trace
+# per question, forever. Keeping them apart means a week of chat traffic does not bury
+# the four runs the class compares.
+CHAT_EXPERIMENT_NAME = os.getenv('MLFLOW_CHAT_EXPERIMENT', 'Bonsai-Care-Chat')
+
+# How many previous turns of a conversation get replayed to the model. Each turn is sent
+# again on every question, so this is a direct cost and latency knob: 6 turns of context
+# on a 20-question conversation is the difference between a cheap demo and an expensive
+# one. It is also why a bot "forgets" — the limit is where memory stops.
+MAX_HISTORY_TURNS = int(os.getenv('CHAT_HISTORY_TURNS', 6))
+
+# How many conversations to keep in memory before the oldest is dropped.
+#
+# In-process and lost on restart, which is wrong for production and right for a class:
+# a real deployment puts this in Redis, and the point of the lesson is the trace in
+# MLflow, not the store. The cap stops a long demo from growing without bound.
+MAX_CONVERSATIONS = int(os.getenv('CHAT_MAX_CONVERSATIONS', 200))
 
 # Which LLM answers, and how, is decided in one place: src/llm_client.py
 MODEL_NAME = llm_client.get_model()
@@ -44,6 +69,67 @@ BONSAI_PROMPTS = prompt_modes.PROMPT_MODES
 # Global variables
 current_prompt_template = BONSAI_PROMPTS["basic"]
 model_info = {}
+tracing_enabled = False
+
+# Conversations in flight, newest last: {session_id: [{"role": ..., "content": ...}, ...]}
+#
+# Flask's development server handles requests on threads, so two browser tabs can land
+# here at the same time. The lock is not ceremony: without it, two questions arriving
+# together can interleave and drop a turn.
+_conversations: "OrderedDict[str, List[Dict[str, str]]]" = OrderedDict()
+_conversations_lock = threading.Lock()
+
+
+def setup_tracing() -> bool:
+    """
+    Turn on MLflow tracing for every LLM call this service makes.
+
+    Two lines do the work. `set_experiment` decides where traces land; `openai.autolog`
+    patches the OpenAI SDK so each `chat.completions.create` records itself — the prompt
+    that went in, the answer that came out, the token counts, the latency, and the error
+    if it failed.
+
+    Note that we talk to Gemini, not OpenAI. The autologger instruments the *SDK*, and
+    Gemini is reached through its OpenAI-compatible endpoint (see src/llm_client.py), so
+    the same integration covers it. Point LLM_BASE_URL at a third provider and tracing
+    keeps working, for the same reason.
+
+    Returns False rather than raising when MLflow is unreachable: a tracking server that
+    is down should cost you observability, not the service.
+    """
+    global tracing_enabled
+
+    try:
+        mlflow.set_tracking_uri(MLFLOW_TRACKING_URI)
+        mlflow.set_experiment(CHAT_EXPERIMENT_NAME)
+        mlflow.openai.autolog()
+        tracing_enabled = True
+        logger.info(f"✅ Tracing into MLflow experiment '{CHAT_EXPERIMENT_NAME}'")
+    except Exception as e:
+        tracing_enabled = False
+        logger.warning(f"⚠️ Tracing is off — could not reach MLflow at {MLFLOW_TRACKING_URI}: {e}")
+
+    return tracing_enabled
+
+
+def get_history(session_id: str) -> List[Dict[str, str]]:
+    """The last MAX_HISTORY_TURNS exchanges of this conversation, oldest first."""
+    with _conversations_lock:
+        return list(_conversations.get(session_id, []))
+
+
+def remember_turn(session_id: str, question: str, answer: str) -> None:
+    """Append one exchange to a conversation, trimming both it and the store."""
+    with _conversations_lock:
+        history = _conversations.pop(session_id, [])
+        history.append({"role": "user", "content": question})
+        history.append({"role": "assistant", "content": answer})
+
+        # Two messages per turn, so the window is twice the turn count.
+        _conversations[session_id] = history[-(MAX_HISTORY_TURNS * 2):]
+
+        while len(_conversations) > MAX_CONVERSATIONS:
+            _conversations.popitem(last=False)
 
 # HTML Template for the chat interface
 CHAT_HTML_TEMPLATE = """
@@ -388,6 +474,19 @@ CHAT_HTML_TEMPLATE = """
             scrollToBottom();
         }
         
+        // One id per browser tab, kept in sessionStorage so a reload continues the same
+        // conversation and a new tab starts a new one. Every message carries it, and the
+        // server hands it to MLflow as the trace's session id — which is how a dozen
+        // separate traces become one readable conversation in the UI.
+        const sessionId = (() => {
+            let id = sessionStorage.getItem('bonsai_session_id');
+            if (!id) {
+                id = 'session-' + Math.random().toString(16).slice(2, 14);
+                sessionStorage.setItem('bonsai_session_id', id);
+            }
+            return id;
+        })();
+
         async function sendMessage() {
             const message = messageInput.value.trim();
             if (!message) return;
@@ -410,7 +509,7 @@ CHAT_HTML_TEMPLATE = """
                     headers: {
                         'Content-Type': 'application/json',
                     },
-                    body: JSON.stringify({ query: message })
+                    body: JSON.stringify({ query: message, session_id: sessionId })
                 });
                 
                 if (!response.ok) {
@@ -522,16 +621,28 @@ def load_champion_prompt() -> bool:
         return use_mode("basic")
 
 
-def query_llm(prompt: str) -> str:
-    """Send a prompt to the configured LLM and return BonsAI's reply."""
+@mlflow.trace(span_type="LLM")
+def query_llm(prompt: str, history: List[Dict[str, str]] | None = None) -> str:
+    """
+    Send a prompt to the configured LLM and return BonsAI's reply.
+
+    The decorator opens a span around this function, and the autologger opens another one
+    inside it for the HTTP call itself. That nesting is the point: the outer span shows
+    what BonsAI decided to send, the inner one shows what the provider did with it. When
+    an answer is wrong, those are two different suspects.
+    """
     if llm is None:
         logger.error("LLM client not initialized — GEMINI_API_KEY is not set")
         return "Sorry, I'm not configured right now: no API key was provided."
 
+    # Earlier turns first, then the templated question. The model sees the conversation.
+    messages = list(history or [])
+    messages.append({"role": "user", "content": prompt})
+
     try:
         response = llm.chat.completions.create(
             model=MODEL_NAME,
-            messages=[{"role": "user", "content": prompt}],
+            messages=messages,
             # Generous on purpose: Gemini spends part of this budget reasoning before it
             # writes anything, and an exhausted budget returns a half-finished sentence
             # rather than an error.
@@ -571,36 +682,83 @@ def health_check():
         "model_info": model_info,
         # Reports how the LLM is configured, and never the key itself.
         "llm": llm_client.describe(),
+        # If traces are missing, this is the first thing to look at.
+        "tracing": {
+            "enabled": tracing_enabled,
+            "experiment": CHAT_EXPERIMENT_NAME,
+            "tracking_uri": MLFLOW_TRACKING_URI,
+            "active_sessions": len(_conversations),
+            "history_turns": MAX_HISTORY_TURNS,
+        },
     })
+
+@mlflow.trace(name="bonsai_chat_turn", span_type="CHAIN")
+def answer_question(user_query: str, session_id: str, turn: int) -> str:
+    """
+    One turn of a conversation: template the question, ask the model, remember the answer.
+
+    This is the traced unit. The decorator makes it the root span, and every span opened
+    underneath — query_llm, and the provider call the autologger captures inside it —
+    hangs off this one. Open a trace in MLflow and you see the whole turn in one tree.
+
+    `update_current_trace` is what turns a pile of traces into conversations. The session
+    id is what the MLflow UI groups by, so tagging it here is the difference between 40
+    unrelated questions and 8 conversations you can read end to end. The prompt version
+    rides along as a tag, which is what lets you ask the question that matters after a
+    deployment: did the answers get worse when we moved the champion alias?
+    """
+    history = get_history(session_id)
+
+    mlflow.update_current_trace(
+        session_id=session_id,
+        tags={
+            "prompt_mode": current_prompt_template['name'],
+            "prompt_source": model_info.get("source", "unknown"),
+            "prompt_version": str(model_info.get("version", "local")),
+            "turn": str(turn),
+        },
+    )
+
+    # Apply BonsAI prompt template
+    # Templates use the registry's {{query}} syntax, so a plain replace — not
+    # str.format, which would choke on the JSON braces inside some prompts.
+    formatted_prompt = current_prompt_template['template'].replace('{{query}}', user_query)
+
+    ai_response = query_llm(formatted_prompt, history=history)
+    remember_turn(session_id, user_query, ai_response)
+
+    return ai_response
+
 
 @app.route('/chat', methods=['POST'])
 def chat():
     """Main chat endpoint for BonsAI assistance"""
     try:
         data = request.get_json()
-        
+
         if not data or 'query' not in data:
             return jsonify({
                 "error": "Missing 'query' field in request"
             }), 400
-        
+
         user_query = data['query']
-        
+
         # Validate input
         if not user_query.strip():
             return jsonify({
                 "error": "Query cannot be empty"
             }), 400
-        
-        # Apply BonsAI prompt template
-        # Templates use the registry's {{query}} syntax, so a plain replace — not
-        # str.format, which would choke on the JSON braces inside some prompts.
-        formatted_prompt = current_prompt_template['template'].replace('{{query}}', user_query)
-        
+
+        # The browser sends the same id for every message in a tab (see sendMessage in the
+        # template). A caller that sends none — curl, or the test suite — gets a fresh
+        # one, so every turn is still attached to a session, just a session of one.
+        session_id = (data.get('session_id') or '').strip() or f"session-{uuid.uuid4().hex[:12]}"
+        turn = len(get_history(session_id)) // 2 + 1
+
         # Query the LLM
-        logger.info(f"🌿 BonsAI processing query: {user_query[:50]}...")
-        ai_response = query_llm(formatted_prompt)
-        
+        logger.info(f"🌿 BonsAI processing query: {user_query[:50]}... [session {session_id} turn {turn}]")
+        ai_response = answer_question(user_query, session_id, turn)
+
         # Prepare response
         response_data = {
             "query": user_query,
@@ -608,12 +766,14 @@ def chat():
             "timestamp": datetime.now().isoformat(),
             "bot_name": "BonsAI",
             "model": MODEL_NAME,
-            "prompt_template": current_prompt_template['name']
+            "prompt_template": current_prompt_template['name'],
+            "session_id": session_id,
+            "turn": turn,
         }
-        
+
         logger.info(f"✅ BonsAI response generated successfully")
         return jsonify(response_data)
-        
+
     except Exception as e:
         logger.error(f"❌ Error in BonsAI chat endpoint: {str(e)}")
         return jsonify({
@@ -805,7 +965,10 @@ def example_queries():
 def initialize_app():
     """Initialize the BonsAI Flask application"""
     logger.info("🌿 Initializing BonsAI Chat Bot")
-    
+
+    # Before anything else answers a question, so no turn goes untraced.
+    setup_tracing()
+
     # Serve whatever currently holds the @champion alias
     if not load_champion_prompt():
         logger.warning("⚠️ Using fallback configuration")

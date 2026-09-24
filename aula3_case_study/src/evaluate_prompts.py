@@ -185,6 +185,15 @@ def main():
     mlflow.set_tracking_uri(args.mlflow_uri)
     mlflow.set_experiment(EXPERIMENT_NAME)
 
+    # Record every scoring call, not just the score it produced.
+    #
+    # A metric tells you a mode scored 0.31. It cannot tell you whether that was four
+    # sensible answers and six refusals, or ten truncated ones. The traces land inside the
+    # nested run for each mode, so the evidence sits next to the number it produced — and
+    # when a result looks wrong, the first question ("what did we actually send?") has an
+    # answer instead of a rerun.
+    mlflow.openai.autolog()
+
     cases = evaluation_set.all_cases()
     limiter = RateLimiter(args.rpm)
 

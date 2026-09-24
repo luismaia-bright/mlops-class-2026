@@ -41,6 +41,14 @@ services:
       - GEMINI_API_KEY=${GEMINI_API_KEY}
       - LLM_MODEL=${LLM_MODEL:-gemini-3.5-flash-lite}
       - LLM_MAX_TOKENS=${LLM_MAX_TOKENS:-2000}
+      # The notebook reads the traces the BonsAI service writes, so both must name the
+      # same experiment. One variable, two services.
+      - MLFLOW_CHAT_EXPERIMENT=${MLFLOW_CHAT_EXPERIMENT:-Bonsai-Care-Chat}
+      # Which model acts as the judge in mlflow.genai.evaluate. MLflow defaults to
+      # openai:/gpt-4.1-mini, which fails with no OpenAI key — a confusing first error in
+      # a lesson about evaluation. `gemini:/` is a native provider, and picks up the same
+      # credential the service already answers with.
+      - MLFLOW_GENAI_JUDGE_DEFAULT_MODEL=gemini:/${LLM_MODEL:-gemini-3.5-flash-lite}
       - GIT_PYTHON_REFRESH=quiet
     command: start-notebook.py --IdentityProvider.token=''
     depends_on:
@@ -60,6 +68,10 @@ services:
       - GEMINI_API_KEY=${GEMINI_API_KEY}
       - LLM_MODEL=${LLM_MODEL:-gemini-3.5-flash-lite}
       - LLM_MAX_TOKENS=${LLM_MAX_TOKENS:-2000}
+      # Where live conversations are traced to. Same default as the notebook's.
+      - MLFLOW_CHAT_EXPERIMENT=${MLFLOW_CHAT_EXPERIMENT:-Bonsai-Care-Chat}
+      # How much of a conversation is replayed to the model on each turn.
+      - CHAT_HISTORY_TURNS=${CHAT_HISTORY_TURNS:-6}
       # MLflow imports GitPython at startup; with no git binary in the image it prints a
       # wall of warnings that buries the evaluation output.
       - GIT_PYTHON_REFRESH=quiet
