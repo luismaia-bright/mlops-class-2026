@@ -1,5 +1,5 @@
 # Class 2 — Infrastructure as Code for MLOps
-
+Bright Version
 You will stand up a complete MLOps stack from a single file, train a bonsai species
 classifier inside it, register the best version, promote it, and watch a serving API pick
 up that promotion without being touched.
